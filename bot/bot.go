@@ -13,6 +13,30 @@ import (
 	"gopkg.in/telegram-bot-api.v4"
 )
 
+func Run(debug, updatesMode bool) {
+	config := Configuration{}
+	if err := config.Load("config.json"); err != nil {
+		log.Fatal(err)
+	}
+	tb := &TelegramBot{}
+	if err := tb.init(config, debug); err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Authorized on account %s\n", tb.BotAPI.Self.UserName)
+	log.Printf("Debug mode: %v\n", tb.BotAPI.Debug)
+	log.Printf("Update mode: %v\n", updatesMode)
+	if updatesMode {
+		if err := tb.setWebhook(config.Webhook.Host, config.Webhook.Port, config.Webhook.Cert, config.Webhook.Priv); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		if err := tb.getUpdates(); err != nil {
+			log.Fatal(err)
+		}
+	}
+	tb.start(config)
+}
+
 type Configuration struct {
 	Description struct {
 		Start    string `json:"start"`
@@ -28,17 +52,20 @@ type Configuration struct {
 		Cert   string `json:"certificate"`
 		Priv   string `json:"private_ssl_key"`
 	} `json:"webhook"`
-	Token   string `json:"token"`
-	AdLink  string `json:"ad_link"`
-	WebSite string `json:"web_side"`
-	Medium  string `json:"medium_channel"`
-	GroupID int64  `json:"group_id"`
-	Proxy   struct {
+	Links struct {
+		Ad      string `json:"ads"`
+		WebSite string `json:"web"`
+		Medium  string `json:"medium"`
+		VK      string `json:"vk"`
+	} `json:links`
+	Proxy struct {
 		URL      string `json:"url"`
 		Login    string `json:"login"`
 		Port     string `json:"port"`
 		Password string `json:"password"`
 	} `json:"proxy"`
+	Token   string `json:"token"`
+	GroupID int64  `json:"group_id"`
 }
 
 func (c *Configuration) Load(file string) error {
@@ -73,7 +100,6 @@ func (tb TelegramBot) setProxy(config Configuration) (*http.Client, error) {
 
 }
 
-//func (tb *TelegramBot) init(token string, debug bool) error {
 func (tb *TelegramBot) init(config Configuration, debug bool) error {
 	//bot, err := tgbotapi.NewBotAPI(token)
 	client, err := tb.setProxy(config)
@@ -106,6 +132,7 @@ func (tb *TelegramBot) getUpdates() error {
 }
 
 func (tb *TelegramBot) setWebhook(host, port, cert, priv string) error {
+	//doesn't work
 	url := host + ":" + port + "/" + tb.BotAPI.Token
 	_, err := tb.BotAPI.SetWebhook(tgbotapi.NewWebhookWithCert(url, cert))
 	if err != nil {
@@ -127,34 +154,120 @@ func (tb *TelegramBot) setWebhook(host, port, cert, priv string) error {
 	return nil
 }
 
-func (tb *TelegramBot) start() error {
-	for update := range tb.Updates {
-		log.Printf("%+v\n", update.Message)
+func (tb TelegramBot) pushDescription(desc string, chatID int64, config Configuration) {
+	preparing := tgbotapi.NewMessage(chatID, desc)
+	preparing.DisableWebPagePreview = true
+	preparing.ParseMode = "markdown"
+	switch desc {
+	case "/ad", "Реклама", "Условия рекламы":
+		preparing.ReplyMarkup = getInlineMarkup(
+			[]string{"Перейти"},
+			[]string{config.Links.Ad},
+		)
+	case "/about", "О проекте", "О канале":
+		preparing.ReplyMarkup = getInlineMarkup(
+			[]string{
+				"Перейти на сайт",
+				"Подписаться medium",
+				"Подписаться VK",
+			},
+			[]string{
+				config.Links.WebSite,
+				config.Links.Medium,
+				config.Links.VK,
+			},
+		)
 	}
-	return nil
+	tb.BotAPI.Send(preparing)
 }
 
-func Run(debug, updatesMode bool) {
-	config := Configuration{}
-	if err := config.Load("config.json"); err != nil {
-		log.Fatal(err)
+func (tb TelegramBot) pushForward(groupID int64, fromID, messageID int) {
+	preparing := tgbotapi.NewForward(groupID, int64(fromID), messageID)
+	tb.BotAPI.Send(preparing)
+}
+
+func (tb TelegramBot) handleUpdates(update tgbotapi.Update, config Configuration) {
+	chat := update.Message.Chat
+	msg := update.Message
+	if desc := getDescription(msg.Text, config); len(desc) > 0 {
+		tb.pushDescription(desc, chat.ID, config)
+		return
 	}
-	tb := &TelegramBot{}
-	if err := tb.init(config, debug); err != nil {
-		log.Fatal(err)
+	if chat.IsPrivate() {
+		tb.pushForward(config.GroupID, msg.From.ID, msg.MessageID)
+		return
 	}
-	log.Printf("Authorized on account %s\nDebug mode: %v\n", tb.BotAPI.Self.UserName, tb.BotAPI.Debug)
-	log.Println("update mode:", updatesMode)
-	if updatesMode {
-		if err := tb.setWebhook(config.Webhook.Host, config.Webhook.Port, config.Webhook.Cert, config.Webhook.Priv); err != nil {
-			log.Fatal(err)
+	bot := tb.BotAPI
+	switch {
+	case msg.ReplyToMessage == nil:
+		preparing := tgbotapi.NewMessage(chat.ID, "Select reply message")
+		bot.Send(preparing)
+		return
+	case msg.ReplyToMessage.ForwardFrom == nil:
+		preparing := tgbotapi.NewMessage(chat.ID, "Choice reply collocutor")
+		bot.Send(preparing)
+		return
+	default:
+		forwardID := int64(msg.ReplyToMessage.ForwardFrom.ID)
+		if msg.Photo != nil {
+			for _, image := range *msg.Photo {
+				preparing := tgbotapi.NewPhotoShare(forwardID, image.FileID)
+				bot.Send(preparing)
+				return
+			}
 		}
-	} else {
-		if err := tb.getUpdates(); err != nil {
-			log.Fatal(err)
+		if msg.Document != nil {
+			preparing := tgbotapi.NewDocumentShare(forwardID, msg.Document.FileID)
+			bot.Send(preparing)
+			return
+		}
+		if msg.Sticker != nil {
+			preparing := tgbotapi.NewStickerShare(forwardID, msg.Sticker.FileID)
+			bot.Send(preparing)
+			return
+		}
+		if len(msg.Text) == 0 {
+			text := "I understand next format: text, photo, sticker, any document"
+			preparing := tgbotapi.NewMessage(chat.ID, text)
+			bot.Send(preparing)
+			return
+		}
+		preparing := tgbotapi.NewMessage(forwardID, msg.Text)
+		bot.Send(preparing)
+		return
+	}
+}
+
+func (tb *TelegramBot) start(config Configuration) {
+	for update := range tb.Updates {
+		if update.Message != nil {
+			tb.handleUpdates(update, config)
 		}
 	}
-	if err := tb.start(); err != nil {
-		log.Fatal(err)
+}
+
+func getDescription(message string, c Configuration) (desc string) {
+	switch message {
+	case "/start":
+		desc = c.Description.Start
+	case "/about", "О проекте", "О канале":
+		desc = c.Description.About
+	case "/feedback", "Оставить отзыв":
+		desc = c.Description.Feedback
+	case "/ad", "Реклама", "Условия рекламы":
+		desc = c.Description.Ad
+	case "/suggest", "Предложить статью", "Предложить новость":
+		desc = c.Description.Suggest
 	}
+	return
+}
+
+func getInlineMarkup(names, links []string) (keyboard tgbotapi.InlineKeyboardMarkup) {
+	for i := 0; i < len(names); i++ {
+		var row []tgbotapi.InlineKeyboardButton
+		button := tgbotapi.NewInlineKeyboardButtonURL(names[i], links[i])
+		row = append(row, button)
+		keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, row)
+	}
+	return
 }
